@@ -341,3 +341,58 @@ input, select {
 .dot.pass { background: var(--hold); }
 .dot.review { background: var(--bad); }
 .dot.insufficient { background: #b08d3f; }
+
+/* ------------------------------------------------------------------ */
+/* 补做排程 */
+/* ------------------------------------------------------------------ */
+#redoPanel .rh-track {
+  background: repeating-linear-gradient(90deg, #fdfbf6 0 20px, #f8f5ec 20px 40px);
+}
+.lg.hist { background: #b9b2a0; }
+.lg.junction { background: #7b4fa0; }
+.lane.hist-lane {
+  height: 30px; opacity: .8;
+  background: repeating-linear-gradient(90deg, #f6f3ec 0 20px, #f1ecdf 20px 40px);
+}
+.lane.hist-lane .lane-name { padding-top: 8px; color: #8a8272; }
+.lane.hist-lane .block {
+  top: 5px; height: 20px; font-size: 9.5px; padding: 3px 4px;
+  filter: grayscale(.45); border-color: rgba(0,0,0,.08);
+}
+.redo-divider {
+  position: absolute; top: 0; bottom: 0; width: 0; z-index: 6;
+  border-left: 2px dashed #7b4fa0; pointer-events: none;
+}
+.redo-divider .divider-tag {
+  position: absolute; top: 0; left: 4px; font-size: 10px; color: #fff;
+  background: #7b4fa0; border-radius: 3px; padding: 1px 5px; white-space: nowrap;
+}
+.redo-lane { height: 40px; border-bottom: 1px solid #f0ebdf;
+  background: repeating-linear-gradient(90deg, #fffdf8 0 20px, #faf7ee 20px 40px); }
+.redo-junction-mark {
+  position: absolute; z-index: 7; top: -2px; font-size: 11px; cursor: help;
+}
+.redo-info {
+  border: 1px solid var(--line); border-radius: 6px; background: #fbf8f1;
+  padding: 8px 12px; margin: 8px 0 2px; font-size: 12.5px; color: var(--ink);
+}
+.redo-info .junction-ok { color: var(--hold); font-weight: 600; }
+.redo-info .junction-bad { color: var(--bad); font-weight: 600; }
+.redo-info .chip {
+  display: inline-block; border: 1px solid var(--accent2); border-radius: 10px;
+  padding: 0 8px; margin: 2px 4px 2px 0; font-size: 11.5px; background: #fff7e8;
+}
+.redo-record {
+  display: flex; justify-content: space-between; align-items: center; gap: 6px;
+  border: 1px dashed var(--line); border-radius: 5px;
+  padding: 6px 9px; margin-top: 7px; font-size: 12px; background: #f8f4fb;
+}
+.redo-record .ops { display: flex; gap: 6px; align-items: center; white-space: nowrap; }
+.redo-record .mini {
+  border: 1px solid #7b4fa0; background: #f4eff9; border-radius: 4px;
+  padding: 1px 7px; cursor: pointer; font-family: inherit; font-size: 11.5px;
+  color: #5d3a7d;
+}
+.redo-record .mini:hover { background: #eadff4; }
+.redo-record .mini.del { border-color: var(--bad); color: var(--bad); background: #fdf1ef; }
+.redo-record .mini.del:hover { background: #f6e0db; }

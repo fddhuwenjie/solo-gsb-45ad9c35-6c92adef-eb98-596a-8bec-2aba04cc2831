@@ -236,7 +236,9 @@ class _Engine:
     def __init__(self, samples: list[_Sample], occs: list[_Occ],
                  capacity: int, board_times: dict[int, int],
                  horizon: int = MAX_HORIZON, validate: bool = False,
-                 max_shift_delta: Optional[float] = None):
+                 max_shift_delta: Optional[float] = None,
+                 prefix_rh: Optional[list[float]] = None,
+                 prefix_load: Optional[list[int]] = None):
         self.samples = samples
         self.by_id = {s.id: s for s in samples if s.id is not None}
         self.occs = sorted(occs, key=lambda o: o.start)
@@ -245,21 +247,36 @@ class _Engine:
         self.horizon = horizon
         self.validate = validate
         self.max_shift_delta = max_shift_delta
+        # 补做排程：prefix_rh/prefix_load 给出冻结历史（含两端的分钟节点
+        # 0..base），仿真只从 base 之后继续；历史段不可修改、不重新校验。
+        if prefix_rh is not None:
+            if not prefix_rh or prefix_load is None or \
+                    len(prefix_load) != len(prefix_rh):
+                raise SchedulingError("补做排程的历史时间轴数据不完整")
+            self.base = len(prefix_rh) - 1
+            self.prefix_rh = list(prefix_rh)
+            self.prefix_load = list(prefix_load)
+        else:
+            self.base = 0
+            self.prefix_rh = None
+            self.prefix_load = None
         self.missions: list[_Mission] = []
-        self.rh: float = 50.0
+        self.rh: float = (self.prefix_rh[-1] if self.prefix_rh is not None
+                          else 50.0)
         self.ramp: Optional[dict] = None
         self.rh_series: list[float] = []
         self.violations: list[dict] = []
         self.load_series: list[int] = []
         self.fatal: Optional[str] = None
 
-        first_board = min(self.bt.values(), default=None)
-        if first_board is not None:
-            s = next(s for s in samples if s.id in self.bt
-                     and self.bt[s.id] == first_board)
-            self.rh = s.eq_rh
-        elif self.occs:
-            self.rh = self.occs[0].rh
+        if self.prefix_rh is None:
+            first_board = min(self.bt.values(), default=None)
+            if first_board is not None:
+                s = next(s for s in samples if s.id in self.bt
+                         and self.bt[s.id] == first_board)
+                self.rh = s.eq_rh
+            elif self.occs:
+                self.rh = self.occs[0].rh
 
     # ---- 辅助 ------------------------------------------------------------ #
     def _active(self, t: int) -> list[_Mission]:
@@ -608,6 +625,11 @@ class _Engine:
                 j += 1
             run = segments[i:j + 1]
             start_min, end_min = run[0]['start'], run[-1]['end']
+            # 补做模式：历史段（换档起始分钟 ≤ base）冻结保留，不以当前
+            # 设置重新校验；衔接处换档从 base 之后开始，照常校验
+            if self.prefix_rh is not None and start_min <= self.base:
+                i = j + 1
+                continue
             frm = run[0].get('from_rh', run[0]['start_rh'])
             to = run[-1]['end_rh']
             prev_hold = next((x for x in reversed(segments[:i])
@@ -695,22 +717,37 @@ class _Engine:
 
     # ---- 主循环 ---------------------------------------------------------- #
     def run(self) -> dict:
-        self.rh_series = [self.rh]
+        # 补做模式：历史为冻结前缀，不在箱的新任务入箱分钟必须严格在 base 之后
+        if self.prefix_rh is not None:
+            bad_bt = [sid for sid, b in self.bt.items() if b <= self.base]
+            if bad_bt:
+                self.fatal = (f"补做样本必须从历史结束分钟 {self.base} 之后"
+                              f"重新安排（入箱分钟需 > {self.base}）")
+            self.rh_series = list(self.prefix_rh)
+            self.load_series = list(self.prefix_load)
+            if self.base + 1 >= self.horizon:
+                if self.fatal is None:
+                    self.fatal = "历史已达排程时间上限，无法安排补做"
+                return self._build(self.base)
+            t_start = self.base
+        else:
+            self.rh_series = [self.rh]
 
-        # 入箱时间为 0 的任务直接装载
-        for s in self.samples:
-            if self.bt.get(s.id) == 0:
-                if abs(self.rh - s.eq_rh) > EPS:
-                    self._viol(0, 'board',
-                               f"样本 {s.code} 的入箱湿度与箱内初始湿度不一致")
-                m0 = _Mission(s, 0)
-                self.missions.append(m0)
-        self.load_series = [len([m for m in self.missions if m.board == 0])
-                            + self._occ_load(0)]
+            # 入箱时间为 0 的任务直接装载
+            for s in self.samples:
+                if self.bt.get(s.id) == 0:
+                    if abs(self.rh - s.eq_rh) > EPS:
+                        self._viol(0, 'board',
+                                   f"样本 {s.code} 的入箱湿度与箱内初始湿度不一致")
+                    m0 = _Mission(s, 0)
+                    self.missions.append(m0)
+            self.load_series = [len([m for m in self.missions if m.board == 0])
+                                + self._occ_load(0)]
+            t_start = 0
 
         stall = 0
         end = self.horizon
-        for t in range(self.horizon):
+        for t in range(t_start, self.horizon):
             if self.ramp is None:
                 self._decide(t)
             self._advance(t + 1)
@@ -1043,10 +1080,18 @@ def _try_order(order: tuple[_Sample, ...], occs: list[_Occ], cap: int,
                 placed_samples.append(s)
                 placed = True
                 break
-            later = [v['minute'] for v in res['violations'] if v['minute'] >= t]
+            # 入箱湿度不匹配（board）通常随预调/占用结束很快解除，逐分钟推进；
+            # 其余违规可跳到最早违规分钟继续尝试
+            later = [v['minute'] for v in res['violations']
+                    if v['minute'] >= t and v['kind'] != 'board']
             jump = min(later, default=None)
             if jump is None and res['fatal']:
-                jump = max(t + 1, res['end_minute'])
+                if res['end_minute'] >= trial_h - 1:
+                    # 只是被试排窗口截断：不能按末尾分钟大跳（会越过可行窗），
+                    # 逐分钟推进
+                    jump = t + 1
+                else:
+                    jump = max(t + 1, res['end_minute'])
             t = max(t + 1, jump if jump is not None else t + 1)
             tries += 1
         if not placed:
@@ -1069,11 +1114,44 @@ def _finalize(samples: list[_Sample], occs: list[_Occ], cap: int,
     return res
 
 
-def _annotate(res: dict, occs: list[_Occ]) -> list[dict]:
-    """为全局轨迹每段标注约束来源。"""
+def _annotate(res: dict, occs: list[_Occ],
+              split_at: Optional[int] = None,
+              extra_lanes: Optional[list[dict]] = None) -> list[dict]:
+    """为全局轨迹每段标注约束来源。
+
+    split_at 给定时（补做排程），在该分钟节点处切开跨接历史/补做的段，
+    使历史段（end ≤ split_at+1 且 start ≤ split_at）与补做段可分开渲染；
+    extra_lanes 提供冻结历史泳道（其 pieces 用于历史段来源标注）。
+    """
+    raw_segments = res['segments']
+    if split_at is not None:
+        cut: list[dict] = []
+        for seg in raw_segments:
+            if seg['start'] < split_at < seg['end'] - 1 \
+                    or (seg['start'] < split_at < seg['end']
+                        and seg['kind'] == 'ramp'):
+                if seg['kind'] == 'hold':
+                    a = dict(seg); a['end'] = split_at + 1
+                    b = dict(seg); b['start'] = split_at + 1
+                    cut.extend([a, b])
+                else:
+                    # 正常不会发生（衔接处两侧必有停留节点）；按线性切分
+                    frm = float(seg.get('from_rh', seg['start_rh']))
+                    steps = seg['end'] - seg['start']
+                    slope = (float(seg['end_rh']) - frm) / steps
+                    mid = frm + slope * (split_at + 1 - seg['start'])
+                    a = dict(seg); a['end'] = split_at + 1
+                    a['end_rh'] = mid
+                    b = dict(seg); b['start'] = split_at + 1
+                    b['from_rh'] = mid; b['start_rh'] = mid
+                    cut.extend([a, b])
+            else:
+                cut.append(dict(seg))
+        raw_segments = cut
+    all_lanes = list(res.get('lanes') or []) + list(extra_lanes or [])
     out = []
-    for seg in res['segments']:
-        aboard = [lane['code'] for lane in res['lanes']
+    for seg in raw_segments:
+        aboard = [lane['code'] for lane in all_lanes
                   if lane['board'] < seg['end'] and
                   (lane.get('unboard') or 10 ** 12) > seg['start']]
         sources = []
@@ -1082,8 +1160,8 @@ def _annotate(res: dict, occs: list[_Occ]) -> list[dict]:
                     seg['kind'] == 'hold' and abs(seg['start_rh'] - o.rh) < EPS:
                 sources.append({'type': 'occupancy', 'occ_id': o.id,
                                 'label': f"已有占用「{o.note or o.id}」"})
-        for lane in res['lanes']:
-            for p in lane['pieces']:
+        for lane in all_lanes:
+            for p in lane.get('pieces') or []:
                 if p['kind'] not in ('ramp', 'hold', 'cooldown', 'cooldown-ramp') \
                         or p['step'] < 0:
                     continue
@@ -1103,6 +1181,9 @@ def _annotate(res: dict, occs: list[_Occ]) -> list[dict]:
         seg2 = dict(seg)
         seg2['aboard'] = aboard
         seg2['sources'] = dedup
+        if split_at is not None:
+            seg2['era'] = 'history' if seg['end'] <= split_at + 1 and \
+                seg['start'] <= split_at else 'redo'
         out.append(seg2)
     return out
 
@@ -1273,3 +1354,468 @@ def fmt_minute(t: int) -> str:
     if m or not out:
         out += f'{m}m'
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 补做排程（基于已保存复核记录）
+# --------------------------------------------------------------------------- #
+_UNSET = object()
+
+# 复核结论（此处用字面量，避免 scheduler 反向依赖 review 模块）
+_REVIEW = 'review'
+_INSUFFICIENT = 'insufficient'
+
+
+def _reconstruct_rh(segments: list[dict]) -> list[float]:
+    """从压缩段还原分钟节点湿度 rh[t]（同 review.plan_series，本地实现保持
+    引擎零依赖）。"""
+    if not segments:
+        return []
+    last_end = max(int(s['end']) for s in segments)
+    rh: list[Optional[float]] = [None] * last_end
+    for seg in segments:
+        s, e = int(seg['start']), int(seg['end'])
+        if s < 0 or e > last_end or e <= s:
+            raise SchedulingError("原排程快照中的计划段区间非法")
+        if seg.get('kind') == 'hold':
+            v = float(seg['start_rh'])
+            for t in range(s, e):
+                rh[t] = v
+        elif seg.get('kind') == 'ramp':
+            frm = float(seg.get('from_rh', seg['start_rh']))
+            steps = e - s
+            slope = (float(seg['end_rh']) - frm) / steps
+            for k in range(steps):
+                rh[s + k] = frm + (k + 1) * slope
+        else:
+            raise SchedulingError(f"未知计划段类型：{seg.get('kind')!r}")
+    if any(v is None for v in rh):
+        raise SchedulingError("原排程快照的计划段在时间轴上不连续")
+    return [float(v) for v in rh]  # type: ignore[arg-type]
+
+
+def _series_from_capacity(capacity_series: list[dict],
+                          end_minute: int) -> list[int]:
+    """把压缩容量占用序列展开为分钟节点序列，长度与 prefix_rh 对齐。"""
+    load = [0] * (end_minute + 1)
+    for c in capacity_series or []:
+        s, e = int(c['start']), int(c['end'])
+        for t in range(s, min(e, end_minute + 1)):
+            load[t] = int(c['load'])
+    return load
+
+
+def redo_failed_samples(source_schedule: dict,
+                        review_samples: list[dict]) -> list[dict]:
+    """从复核结果挑出结论为「复核」或「数据不足」的样本；
+    通过样本不补做；只保留原排程中实际存在且有完整定义的样本。"""
+    lanes = source_schedule.get('lanes') or []
+    defs = {int(s['id']): s for s in (source_schedule.get('samples') or [])
+            if s.get('id') is not None}
+    lane_order = [int(l['sample_id']) for l in lanes
+                  if l.get('sample_id') is not None]
+    by_conclusion = {int(s['sample_id']): s for s in review_samples
+                     if s.get('sample_id') is not None
+                     and s.get('conclusion') in (_REVIEW, _INSUFFICIENT)}
+    out: list[dict] = []
+    for sid in lane_order:
+        if sid in by_conclusion and sid in defs:
+            out.append(defs[sid])
+    # 原排程 lanes 之外但复核中出现的失败样本（防御性，正常不会发生）
+    for sid in by_conclusion:
+        if sid not in {x['id'] for x in out} and sid in defs:
+            out.append(defs[sid])
+    return out
+
+
+def redo_plan(source_schedule: dict, review_samples: list[dict],
+              capacity: Any = None,
+              max_shift_delta: Any = _UNSET,
+              horizon: int = MAX_HORIZON) -> dict:
+    """对一次已保存复核生成补做排程。
+
+    * 只取结论为「复核」/「数据不足」的样本，通过样本不重复安排；
+    * 原排程时间轴（0..end_minute，含占用）整体冻结为不可修改的历史；
+    * 补做任务只能在历史结束分钟之后入箱，继续满足容量、耐受区间、
+      不可相邻、换档速率与独立换档上限；历史结束湿度→补做首次换档
+      （衔接处）也要校验独立换档上限差值；
+    * 没有失败样本 → feasible=True 的空方案；
+    * 无解 → feasible=False，携带冲突与最小调整建议，不产生半成品。
+    """
+    if not isinstance(source_schedule, dict):
+        raise SchedulingError("缺少原排程快照")
+    segments = source_schedule.get('segments') or []
+    lanes = source_schedule.get('lanes') or []
+    if not segments or not lanes:
+        raise SchedulingError("原排程快照缺少时间轴（segments/lanes）")
+    base = int(source_schedule.get('end_minute'))
+    if base < 0:
+        raise SchedulingError("原排程结束分钟非法")
+
+    if capacity is None:
+        capacity = source_schedule.get('capacity')
+    cap = int(_num(capacity, "恒湿箱容量", integer=True, lo=1))
+    if max_shift_delta is _UNSET:
+        shift_limit = normalize_max_shift_delta(
+            source_schedule.get('max_shift_delta'))
+    else:
+        shift_limit = normalize_max_shift_delta(max_shift_delta)
+    occs = [normalize_occ(o) for o in
+            (source_schedule.get('occupancies') or [])]
+
+    failed_raw = redo_failed_samples(source_schedule, review_samples or [])
+    failed = [normalize_sample(d) for d in failed_raw]
+    ids = {s.id for s in failed}
+    for s in failed:
+        # 互斥只保留失败样本之间的关系（通过样本不在箱中，不构成约束）
+        s.excludes = {x for x in s.excludes if x in ids and x != s.id}
+
+    hist_rh = _reconstruct_rh(segments)
+    if base + 1 > len(hist_rh):
+        hist_rh = hist_rh + [hist_rh[-1]] * (base + 1 - len(hist_rh))
+    hist_rh = hist_rh[:base + 1]
+    hist_load = _series_from_capacity(
+        source_schedule.get('capacity_series') or [], base)
+    end_rh = hist_rh[base]
+
+    meta = {
+        'kind': 'redo',
+        'redo': True,
+        'base_minute': base,
+        'base_display': fmt_minute(base),
+        'end_rh': round(end_rh, 2),
+        'failed_samples': [_sample_json(s) for s in failed],
+        'passed_samples': [int(l['sample_id']) for l in lanes
+                           if l.get('sample_id') is not None
+                           and l['sample_id'] not in ids],
+        'history': {
+            'end_minute': base,
+            'end_display': fmt_minute(base),
+            'end_rh': round(end_rh, 2),
+        },
+        'capacity': cap,
+        'max_shift_delta': shift_limit,
+        'occupancies': [_occ_json(o) for o in occs],
+    }
+
+    if not failed:
+        history_segments = _annotate(
+            {'segments': compress(hist_rh), 'lanes': []}, occs, base,
+            extra_lanes=lanes)
+        return {**meta,
+                'feasible': True, 'empty': True,
+                'fatal': None, 'violations': [], 'conflicts': [],
+                'minimal_adjustment': None,
+                'board_times': {}, 'end_minute': base,
+                'segments': history_segments,
+                'history_segments': history_segments,
+                'redo_segments': [],
+                'lanes': [], 'history_lanes': list(lanes),
+                'capacity_series': _compress_load(hist_load),
+                'samples': [],
+                'junction': {'base_minute': base,
+                             'from_rh': round(end_rh, 2),
+                             'to_rh': round(end_rh, 2),
+                             'delta': 0.0, 'within_limit': True,
+                             'limit': shift_limit,
+                             'label': '无失败样本，无需补做'}}
+
+    # 静态硬冲突（占用超容量 / 占用重叠 / 失败样本间区间不相交且未互斥）
+    pre = _static_conflicts(failed, occs, cap)
+    # 补做区间落在历史之后：仅统计结束分钟晚于 base 的占用窗口压迫
+    for c in _redo_occ_window_conflicts(failed, occs, cap, base):
+        if not any(_same_conflict(c, x) for x in pre):
+            pre.append(c)
+    pre_shift = _static_shift_conflicts(failed, shift_limit)
+    if pre or pre_shift:
+        return _redo_infeasible(meta, hist_rh, hist_load, lanes,
+                                pre + pre_shift, occs)
+    # 衔接处：从历史结束湿度到任一失败样本平衡湿度都无法一跳到达
+    # （且历史之后没有占用段可作中途停留湿度） → 错峰也无法消除
+    junction_conf = _redo_junction_conflict(failed, occs, base, end_rh,
+                                            shift_limit)
+    if junction_conf:
+        return _redo_infeasible(meta, hist_rh, hist_load, lanes,
+                                [junction_conf], occs)
+
+    best_bt: Optional[dict[int, int]] = None
+    for order in _candidate_orders(failed):
+        bt = _try_redo_order(order, occs, cap, horizon, shift_limit,
+                             base, hist_rh, hist_load)
+        if bt is not None:
+            best_bt = bt
+            break
+
+    if best_bt is None:
+        conflicts = _redo_diagnose(failed, occs, cap, horizon, shift_limit,
+                                   base, hist_rh, hist_load, end_rh)
+        return _redo_infeasible(meta, hist_rh, hist_load, lanes,
+                                conflicts, occs)
+
+    res = _Engine(failed, occs, cap, best_bt, horizon=horizon,
+                  max_shift_delta=shift_limit,
+                  prefix_rh=hist_rh, prefix_load=hist_load).run()
+    if res['fatal'] is not None or res['violations']:
+        # 理论上不会发生（候选 bt 已通过完整仿真）；保险起见按无解返回
+        conflicts = _redo_diagnose(failed, occs, cap, horizon, shift_limit,
+                                   base, hist_rh, hist_load, end_rh)
+        return _redo_infeasible(meta, hist_rh, hist_load, lanes,
+                                conflicts, occs)
+
+    junction = _redo_junction(res['segments'], base, end_rh, shift_limit)
+    if shift_limit is not None and not junction['within_limit']:
+        # 搜索本应排除这种 bt；保险起见按无解诊断处理，不保存半成品
+        conflicts = _redo_diagnose(failed, occs, cap, horizon, shift_limit,
+                                   base, hist_rh, hist_load, end_rh)
+        return _redo_infeasible(meta, hist_rh, hist_load, lanes,
+                                conflicts, occs)
+
+    all_segments = _annotate(res, occs, base, extra_lanes=lanes)
+    history_segments = [s for s in all_segments if s.get('era') == 'history']
+    redo_segments = [s for s in all_segments if s.get('era') == 'redo']
+    redo_lanes = [_lane_json(l) for l in res['lanes']]
+    return {**meta,
+            'feasible': True, 'empty': False,
+            'fatal': None, 'violations': [], 'conflicts': [],
+            'minimal_adjustment': None,
+            'board_times': best_bt,
+            'end_minute': res['end_minute'],
+            'segments': all_segments,
+            'history_segments': history_segments,
+            'redo_segments': redo_segments,
+            'lanes': redo_lanes,
+            'history_lanes': list(lanes),
+            'capacity_series': res['capacity_series'],
+            'samples': [_sample_json(s) for s in failed],
+            'junction': junction}
+
+
+def _same_conflict(a: dict, b: dict) -> bool:
+    return a.get('kind') == b.get('kind') and a.get('message') == b.get('message')
+
+
+def _try_redo_order(order: tuple[_Sample, ...], occs: list[_Occ], cap: int,
+                    horizon: int, shift_limit: Optional[float],
+                    base: int, hist_rh: list[float],
+                    hist_load: list[int]) -> Optional[dict[int, int]]:
+    """固定装载顺序，逐样本贪心寻找历史结束分钟之后最早可行的入箱分钟。"""
+    board_times: dict[int, int] = {}
+    placed: list[_Sample] = []
+    for s in order:
+        placed_bt = False
+        t = base + 1
+        tries = 0
+        while tries < RETRY_LIMIT and t < horizon:
+            trial = dict(board_times)
+            trial[s.id] = t
+            trial_h = min(horizon,
+                          t + 2 * s.mission_minutes + 6 * 60 +
+                          sum(max(0, o.end - base) for o in occs if o.end > base)
+                          + 120)
+            trial_h = max(trial_h,
+                          max(board_times.values(), default=base + 1) +
+                          2 * s.mission_minutes + 120)
+            res = _Engine(placed + [s], occs, cap, trial,
+                          horizon=trial_h,
+                          max_shift_delta=shift_limit,
+                          prefix_rh=hist_rh,
+                          prefix_load=hist_load).run()
+            if res['fatal'] is None and not res['violations']:
+                board_times[s.id] = t
+                placed.append(s)
+                placed_bt = True
+                break
+            later = [v['minute'] for v in res['violations']
+                     if v['minute'] > base and v['kind'] != 'board']
+            jump = min(later, default=None)
+            if jump is None and res['fatal']:
+                jump = max(t + 1, res['end_minute'])
+            t = max(t + 1, jump if jump is not None else t + 1)
+            tries += 1
+        if not placed_bt:
+            return None
+    return board_times
+
+
+def _redo_occ_window_conflicts(samples: list[_Sample], occs: list[_Occ],
+                               cap: int, base: int) -> list[dict]:
+    """补做可用窗口（base 之后）长度不足以完成必要换档的硬冲突。"""
+    conf: list[dict] = []
+    later = [o for o in occs if o.end > base]
+    if not later:
+        return conf
+    o = min(later, key=lambda x: x.start)
+    window = max(0, o.start - base)
+    for s in samples:
+        need = ramp_minutes(s.eq_rh, o.rh, s.min_rate)
+        if abs(s.eq_rh - o.rh) > EPS and need > window:
+            conf.append({
+                'kind': 'occupancy-window', 'severity': 'hard',
+                'message': f"补做从历史结束（{fmt_minute(base)}）开始，"
+                           f"首个占用段 {fmt_minute(o.start)} 起固定 {o.rh:g}%，"
+                           f"样本 {s.code} 从平衡湿度 {s.eq_rh:g}% 换档至少 "
+                           f"{need} 分钟，但衔接窗口只有 {window} 分钟",
+                'suggestion': {
+                    'type': 'occupancy',
+                    'title': f'把占用段「{o.note or o.id}」至少后移 '
+                             f'{need - window} 分钟',
+                    'delta': need - window, 'value': None}})
+    return conf
+
+
+def _redo_junction_conflict(samples: list[_Sample], occs: list[_Occ],
+                            base: int, end_rh: float,
+                            shift_limit: Optional[float]) -> Optional[dict]:
+    """历史结束湿度无法在独立换档上限内到达任何一个失败样本的平衡湿度，
+    且历史之后没有占用段可提供中途停留湿度 → 衔接处无解。"""
+    if shift_limit is None:
+        return None
+    later_rhs = [o.rh for o in occs if o.start >= base]
+    worst = 0.0
+    reachable_any = False
+    for s in samples:
+        d = abs(s.eq_rh - end_rh)
+        if d <= shift_limit + EPS:
+            reachable_any = True
+            continue
+        # 存在一个未来占用湿度可作"垫步"：end_rh→occ.rh 与 occ.rh→eq_rh
+        # 都不超限，即可以两跳到达
+        step = any(abs(o_rh - end_rh) <= shift_limit + EPS and
+                   abs(s.eq_rh - o_rh) <= shift_limit + EPS
+                   for o_rh in later_rhs)
+        if step:
+            reachable_any = True
+        else:
+            worst = max(worst, d)
+    if reachable_any or worst <= EPS:
+        return None
+    need = ceil_tenth(worst)
+    return {
+        'kind': 'shift-limit', 'severity': 'hard',
+        'message': f"补做衔接处：历史结束湿度 {end_rh:g}%RH 到失败样本入箱"
+                   f"平衡湿度的最大差值为 {worst:g}%RH，超过独立换档上限 "
+                   f"{shift_limit:g}%RH，且历史之后没有占用段可作中途停留，"
+                   f"任何入箱时刻都无法衔接",
+        'suggestion': {'type': 'shift-limit',
+                       'title': f'把独立换档上限放宽到 {need:g}%RH',
+                       'delta': round(worst - shift_limit, 2),
+                       'value': need}}
+
+
+def _redo_junction(segments: list[dict], base: int, end_rh: float,
+                   shift_limit: Optional[float]) -> dict:
+    """衔接处换档差值：取从历史末端湿度出发、进入补做后的第一次换档，
+    按整次换档（连续 ramp 合并）两端停留湿度计算差值。"""
+    i = 0
+    while i < len(segments) and segments[i]['start'] < base:
+        i += 1
+    j = i
+    frm = end_rh
+    while j < len(segments) and segments[j]['kind'] != 'ramp':
+        # 补做开始后若先有一段新的 hold（预调到中途湿度），衔接换档的
+        # 起点仍是历史末端湿度
+        j += 1
+    if j >= len(segments):
+        to = end_rh
+    else:
+        k = j
+        while k + 1 < len(segments) and segments[k + 1]['kind'] == 'ramp' \
+                and segments[k + 1]['start'] == segments[k]['end']:
+            k += 1
+        frm = segments[j].get('from_rh', segments[j]['start_rh'])
+        to = segments[k]['end_rh']
+    delta = abs(to - frm)
+    return {'base_minute': base,
+            'from_rh': round(frm, 2), 'to_rh': round(to, 2),
+            'delta': round(delta, 2),
+            'limit': shift_limit,
+            'within_limit': shift_limit is None or delta <= shift_limit + EPS,
+            'label': f"衔接处换档 {fmt_minute(base)}：{frm:g}% → {to:g}%，"
+                     f"差值 {delta:g}%RH" +
+                     ('' if shift_limit is None else
+                      f"（上限 {shift_limit:g}%RH"
+                      + ('，通过）' if delta <= shift_limit + EPS
+                         else '，超限）'))}
+
+
+def _redo_diagnose(samples: list[_Sample], occs: list[_Occ], cap: int,
+                   horizon: int, shift_limit: Optional[float],
+                   base: int, hist_rh: list[float], hist_load: list[int],
+                   end_rh: float) -> list[dict]:
+    """补做无解诊断：先在补做窗口上做全样本同时入箱探针，抓"错峰也无法
+    消除"的独立换档超限（含衔接处）；再叠加通用容量/占用/机时诊断。"""
+    advice: list[dict] = []
+    if shift_limit is not None and samples:
+        bt = {s.id: base + 1 for s in samples}
+        probe = _Engine(samples, occs, cap, bt, horizon=horizon,
+                        validate=True, max_shift_delta=shift_limit,
+                        prefix_rh=hist_rh, prefix_load=hist_load).run()
+        shift_v = [v for v in probe['violations']
+                   if v['kind'] == 'shift-limit']
+        if shift_v:
+            worst = max(v['delta'] for v in shift_v)
+            need = ceil_tenth(worst)
+            advice.append({
+                'kind': 'shift-limit', 'severity': 'hard',
+                'message': f"补做时间轴上有 {len(shift_v)} 处相邻段目标差值"
+                           f"超过独立换档上限 {shift_limit:g}%RH"
+                           f"（最大 {worst:g}%RH），错峰装载也无法避开："
+                           f"{shift_v[0]['message']}",
+                'suggestion': {'type': 'shift-limit',
+                               'title': f'把独立换档上限放宽到 {need:g}%RH',
+                               'delta': round(worst - shift_limit, 2),
+                               'value': need}})
+
+    generic = [a for a in _diagnose(samples, occs, cap, horizon, shift_limit)
+               if a['kind'] != 'shift-limit']
+    for a in generic:
+        if not any(_same_conflict(a, x) for x in advice):
+            advice.append(a)
+    return advice or [{
+        'kind': 'combination', 'severity': 'hard',
+        'message': '补做样本在容量、区间兼容、换档上限与历史衔接的联合约束下'
+                   '均无法安排在历史结束分钟之后',
+        'suggestion': {'type': 'occupancy',
+                       'title': '后移或移除历史之后的已有占用，再重新生成补做',
+                       'delta': 1, 'value': None}}]
+
+
+def _compress_load(load: list[int]) -> list[dict]:
+    out: list[dict] = []
+    for t, v in enumerate(load):
+        if out and out[-1]['load'] == v and out[-1]['end'] == t:
+            out[-1]['end'] = t + 1
+        else:
+            out.append({'start': t, 'end': t + 1, 'load': v})
+    while len(out) > 1 and out[-1]['load'] == 0:
+        out.pop()
+    return out
+
+
+def _lane_json(lane: dict) -> dict:
+    return {'sample_id': lane['sample_id'], 'code': lane['code'],
+            'rh_min': lane['rh_min'], 'rh_max': lane['rh_max'],
+            'eq_rh': lane['eq_rh'], 'board': lane['board'],
+            'unboard': lane['unboard'], 'pieces': lane['pieces']}
+
+
+def _redo_infeasible(meta: dict, hist_rh: list[float], hist_load: list[int],
+                     history_lanes: list[dict], conflicts: list[dict],
+                     occs: list[_Occ]) -> dict:
+    history_segments = _annotate(
+        {'segments': compress(hist_rh), 'lanes': []}, occs,
+        len(hist_rh) - 1, extra_lanes=history_lanes)
+    return {**meta,
+            'feasible': False, 'empty': False,
+            'fatal': 'NO_FEASIBLE_REDO',
+            'violations': [], 'conflicts': conflicts,
+            'minimal_adjustment': conflicts[0]['suggestion']
+            if conflicts else None,
+            'board_times': {}, 'end_minute': len(hist_rh) - 1,
+            'segments': history_segments,
+            'history_segments': history_segments,
+            'redo_segments': [],
+            'lanes': [], 'history_lanes': list(history_lanes),
+            'capacity_series': _compress_load(hist_load),
+            'samples': meta['failed_samples'],
+            'junction': None}

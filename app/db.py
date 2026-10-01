@@ -54,6 +54,14 @@ CREATE TABLE IF NOT EXISTS reviews (
     note       TEXT NOT NULL DEFAULT '',
     payload    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS redo_schedules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    review_id   INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+    base_minute INTEGER NOT NULL,
+    end_minute  INTEGER NOT NULL,
+    payload     TEXT NOT NULL
+);
 """
 
 
@@ -223,10 +231,14 @@ class DB:
             out = []
             for r in rows:
                 d = json.loads(r['payload'])
+                # 列表视图不回传嵌入的原排程快照（体积大），仅标记其存在；
+                # 单条 GET /api/reviews/{id} 仍返回完整 payload 供补做使用
+                has_source = bool(d.get('source_schedule'))
                 out.append({'id': r['id'], 'created_at': r['created_at'],
                             'conclusion': r['conclusion'], 'note': r['note'],
                             'summary': d.get('summary'),
                             'parameters': d.get('parameters'),
+                            'has_source_schedule': has_source,
                             'payload': d})
             return out
 
@@ -246,4 +258,66 @@ class DB:
 
     def delete_review(self, rid: int) -> None:
         with self.conn() as c:
+            c.execute("DELETE FROM redo_schedules WHERE review_id=?", (int(rid),))
             c.execute("DELETE FROM reviews WHERE id=?", (int(rid),))
+
+    # ---------------- 补做排程 ---------------- #
+    def save_redo(self, payload: dict, review_id: int) -> int:
+        with self.conn() as c:
+            cur = c.execute(
+                "INSERT INTO redo_schedules(review_id,base_minute,end_minute,"
+                "payload) VALUES (?,?,?,?)",
+                (int(review_id), int(payload.get('base_minute', 0)),
+                 int(payload.get('end_minute', 0)),
+                 json.dumps(payload, ensure_ascii=False)))
+            return int(cur.lastrowid)
+
+    def list_redo(self, limit: int = 50) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT id,created_at,review_id,base_minute,end_minute,payload"
+                " FROM redo_schedules ORDER BY id DESC LIMIT ?",
+                (int(limit),)).fetchall()
+            out = []
+            for r in rows:
+                d = json.loads(r['payload'])
+                out.append({'id': r['id'], 'created_at': r['created_at'],
+                            'review_id': r['review_id'],
+                            'base_minute': r['base_minute'],
+                            'end_minute': r['end_minute'],
+                            'summary': {
+                                'failed': len(d.get('failed_samples') or []),
+                                'passed': len(d.get('passed_samples') or []),
+                            },
+                            'junction': d.get('junction'),
+                            'payload': d})
+            return out
+
+    def get_redo(self, redo_id: int) -> dict | None:
+        with self.conn() as c:
+            r = c.execute(
+                "SELECT id,created_at,review_id,base_minute,end_minute,payload"
+                " FROM redo_schedules WHERE id=?", (int(redo_id),)).fetchone()
+            if not r:
+                return None
+            d = json.loads(r['payload'])
+            return {'id': r['id'], 'created_at': r['created_at'],
+                    'review_id': r['review_id'],
+                    'base_minute': r['base_minute'],
+                    'end_minute': r['end_minute'], 'payload': d}
+
+    def list_redo_for_review(self, review_id: int) -> list[dict]:
+        with self.conn() as c:
+            rows = c.execute(
+                "SELECT id,created_at,review_id,base_minute,end_minute,payload"
+                " FROM redo_schedules WHERE review_id=? ORDER BY id",
+                (int(review_id),)).fetchall()
+            return [{'id': r['id'], 'created_at': r['created_at'],
+                     'review_id': r['review_id'],
+                     'base_minute': r['base_minute'],
+                     'end_minute': r['end_minute'],
+                     'payload': json.loads(r['payload'])} for r in rows]
+
+    def delete_redo(self, redo_id: int) -> None:
+        with self.conn() as c:
+            c.execute("DELETE FROM redo_schedules WHERE id=?", (int(redo_id),))

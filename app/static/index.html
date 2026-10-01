@@ -150,6 +150,39 @@
         <div id="rvSamples"></div>
       </div>
     </div>
+  <!-- 补做排程 -->
+  <section class="panel wide" id="redoPanel" style="grid-column: 1 / -1;">
+    <div class="panel-head">
+      <h2>⑥ 补做排程（选择一条已保存复核，仅重排「复核」/「数据不足」样本）</h2>
+      <div class="legend">
+        <span><i class="lg hist"></i>原排程历史（冻结不可改）</span>
+        <span><i class="lg ramp"></i>补做换档</span>
+        <span><i class="lg hold"></i>补做保持</span>
+        <span><i class="lg junction"></i>新旧衔接处</span>
+      </div>
+    </div>
+    <div class="form-hint" style="margin-bottom:8px">
+      系统只提取结论为<b>「复核」或「数据不足」</b>的样本；该复核对应的原排程
+      （含全部占用）作为<b>不可修改的历史</b>完整保留，补做任务从其结束分钟之后
+      重新安排，继续满足箱容量、耐受区间、不可相邻、换档速率与独立换档上限，
+      <b>新旧时间轴衔接处的换档差值也会校验</b>。通过样本不会被重复安排；
+      没有失败样本时返回空方案；补做无冲突后才会保存。
+    </div>
+    <div class="runbar">
+      <button class="btn primary" id="redoReload">↻ 刷新已保存补做方案</button>
+      <button class="btn" id="redoExport">⬇ 导出补做方案 JSON</button>
+    </div>
+    <div id="redoStatus" class="status">尚未生成补做排程。请在⑤的「已保存复核记录」中选择一条，点击「补做排程」。</div>
+    <div id="redoConflictBox" class="conflicts hidden"></div>
+    <div class="timeline-wrap">
+      <div id="redoRuler" class="ruler"></div>
+      <div id="redoRhTrack" class="rh-track"></div>
+      <div id="redoHistLanes"></div>
+      <div id="redoLanes"></div>
+      <div id="redoOccTrack" class="occ-track"></div>
+      <div id="redoCapTrack" class="cap-track"></div>
+    </div>
+    <div id="redoRecordList"></div>
   </section>
 </main>
 

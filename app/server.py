@@ -268,7 +268,11 @@ def run_review():
         review_mod.CONCLUSION_LABELS[overall]
     if body.get('save'):
         note = str(body.get('note') or '')
+        # 保存时把本次复核对应的排程快照完整嵌入复核记录，
+        # 使该复核日后可独立用于「补做排程」（历史不可变）
+        res['source_schedule'] = schedule_obj
         rid = db.save_review(res, overall, note)
+        res.pop('source_schedule', None)
         res['saved'] = True
         res['review_id'] = rid
         created = db.get_review(rid)
@@ -298,6 +302,100 @@ def get_review(rid: int):
 @app.delete('/api/reviews/<int:rid>')
 def remove_review(rid: int):
     db.delete_review(rid)
+    return jsonify({'ok': True})
+
+
+# --------------------------------------------------------------------------- #
+# 补做排程（基于已保存复核）
+# --------------------------------------------------------------------------- #
+def _redo_source(review_rec: dict):
+    """补做所用的冻结历史 = 保存复核时嵌入的原排程快照；
+    极旧记录没有嵌入快照时回退到最近排程快照。"""
+    payload = review_rec.get('payload') or review_rec
+    src = payload.get('source_schedule')
+    if src:
+        return src
+    latest = db.latest_schedule()
+    if latest is None:
+        return None
+    return latest
+
+
+@app.post('/api/reviews/<int:rid>/redo')
+def run_redo(rid: int):
+    """对已保存复核记录生成补做排程。
+
+    只提取结论为「复核」/「数据不足」的样本；原排程完整保留为不可修改
+    历史，补做从其结束分钟之后安排；继续满足容量/耐受区间/不可相邻/换档
+    速率/独立换档上限（含新旧时间轴衔接处换档差值），沿用原有占用。
+    无失败样本 → 空方案（不保存）；无解 → 冲突，不保存半成品；
+    有解且非空 → 持久化补做方案并返回 redo_id。
+    """
+    rec = db.get_review(rid)
+    if rec is None:
+        return jsonify({'error': '复核记录不存在'}), 404
+    payload = rec.get('payload') or {}
+    source = _redo_source(rec)
+    if not source:
+        return jsonify({'error': '该复核记录未携带原排程快照，且库中没有'
+                                 '任何排程可作冻结历史，无法补做'}), 400
+    if not source.get('feasible'):
+        return jsonify({'error': '原排程不可行，无法在其结束分钟之后补做'}), 400
+    review_samples = payload.get('samples') or []
+    body = request.get_json(force=True, silent=True) or {}
+    try:
+        kwargs = {}
+        if 'capacity' in body:
+            kwargs['capacity'] = body['capacity']
+        # max_shift_delta 缺省时 redo_plan 沿用原排程保存值；
+        # 显式传 null 表示本次不限制（旧数据也按不限制处理）
+        if 'max_shift_delta' in body:
+            kwargs['max_shift_delta'] = body['max_shift_delta']
+        res = scheduler.redo_plan(source, review_samples, **kwargs)
+    except scheduler.SchedulingError as e:
+        return jsonify({'error': str(e)}), 400
+
+    res['review_id'] = rid
+    if res.get('feasible') and not res.get('empty'):
+        redo_id = db.save_redo(res, rid)
+        res['saved'] = True
+        res['redo_id'] = redo_id
+        saved = db.get_redo(redo_id)
+        res['created_at'] = saved['created_at'] if saved else None
+    else:
+        res['saved'] = False
+        if res.get('empty'):
+            res['message'] = '该复核记录没有结论为「复核」或「数据不足」' \
+                             '的样本，无需补做（空方案，未保存）'
+    return jsonify(res)
+
+
+@app.get('/api/redo')
+def list_redo():
+    try:
+        limit = max(1, min(200, int(request.args.get('limit', 50))))
+    except ValueError:
+        limit = 50
+    review_id = request.args.get('review_id')
+    if review_id:
+        try:
+            return jsonify(db.list_redo_for_review(int(review_id)))
+        except ValueError:
+            return jsonify([])
+    return jsonify(db.list_redo(limit))
+
+
+@app.get('/api/redo/<int:redo_id>')
+def get_redo(redo_id):
+    rec = db.get_redo(redo_id)
+    if rec is None:
+        return jsonify({'error': '补做排程不存在'}), 404
+    return jsonify(rec)
+
+
+@app.delete('/api/redo/<int:redo_id>')
+def remove_redo(redo_id):
+    db.delete_redo(redo_id)
     return jsonify({'ok': True})
 
 
