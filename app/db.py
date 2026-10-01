@@ -54,6 +54,13 @@ CREATE TABLE IF NOT EXISTS reviews (
     note       TEXT NOT NULL DEFAULT '',
     payload    TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS redo_plans (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    review_id  INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+    feasible   INTEGER NOT NULL,
+    payload    TEXT NOT NULL
+);
 """
 
 
@@ -223,11 +230,17 @@ class DB:
             out = []
             for r in rows:
                 d = json.loads(r['payload'])
+                # 列表视图只保留摘要；完整时间轴/内嵌原排程走 GET 单条
+                light = {k: v for k, v in d.items()
+                         if k in ('overall_conclusion',
+                                  'overall_conclusion_label',
+                                  'summary', 'parameters', 'saved',
+                                  'review_id', 'created_at')}
                 out.append({'id': r['id'], 'created_at': r['created_at'],
                             'conclusion': r['conclusion'], 'note': r['note'],
                             'summary': d.get('summary'),
                             'parameters': d.get('parameters'),
-                            'payload': d})
+                            'payload': light})
             return out
 
     def get_review(self, rid: int) -> dict | None:
@@ -246,4 +259,68 @@ class DB:
 
     def delete_review(self, rid: int) -> None:
         with self.conn() as c:
+            c.execute("DELETE FROM redo_plans WHERE review_id=?", (int(rid),))
             c.execute("DELETE FROM reviews WHERE id=?", (int(rid),))
+
+    # ---------------- 补做排程 ---------------- #
+    def save_redo_plan(self, review_id: int, payload: dict) -> int:
+        with self.conn() as c:
+            cur = c.execute(
+                "INSERT INTO redo_plans(review_id,feasible,payload)"
+                " VALUES (?,?,?)",
+                (int(review_id), 1 if payload.get('feasible') else 0,
+                 json.dumps(payload, ensure_ascii=False)))
+            return int(cur.lastrowid)
+
+    def list_redo_plans(self, review_id: int | None = None) -> list[dict]:
+        with self.conn() as c:
+            if review_id is not None:
+                rows = c.execute(
+                    "SELECT id,created_at,review_id,feasible,payload"
+                    " FROM redo_plans WHERE review_id=? ORDER BY id",
+                    (int(review_id),)).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT id,created_at,review_id,feasible,payload"
+                    " FROM redo_plans ORDER BY id DESC LIMIT 200").fetchall()
+            out = []
+            for r in rows:
+                d = json.loads(r['payload'])
+                out.append({'id': r['id'], 'created_at': r['created_at'],
+                            'review_id': r['review_id'],
+                            'feasible': bool(r['feasible']),
+                            'empty': bool(d.get('empty')),
+                            'end_minute': d.get('end_minute'),
+                            'history_end_minute': d.get('history_end_minute'),
+                            'failed_sample_ids': d.get('failed_sample_ids'),
+                            'payload': d})
+            return out
+
+    def latest_redo_for_review(self, review_id: int) -> dict | None:
+        with self.conn() as c:
+            r = c.execute(
+                "SELECT id,created_at,review_id,feasible,payload"
+                " FROM redo_plans WHERE review_id=? ORDER BY id DESC LIMIT 1",
+                (int(review_id),)).fetchone()
+            if not r:
+                return None
+            return {'id': r['id'], 'created_at': r['created_at'],
+                    'review_id': r['review_id'],
+                    'feasible': bool(r['feasible']),
+                    'payload': json.loads(r['payload'])}
+
+    def get_redo_plan(self, pid: int) -> dict | None:
+        with self.conn() as c:
+            r = c.execute(
+                "SELECT id,created_at,review_id,feasible,payload"
+                " FROM redo_plans WHERE id=?", (int(pid),)).fetchone()
+            if not r:
+                return None
+            return {'id': r['id'], 'created_at': r['created_at'],
+                    'review_id': r['review_id'],
+                    'feasible': bool(r['feasible']),
+                    'payload': json.loads(r['payload'])}
+
+    def delete_redo_plan(self, pid: int) -> None:
+        with self.conn() as c:
+            c.execute("DELETE FROM redo_plans WHERE id=?", (int(pid),))

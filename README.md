@@ -31,6 +31,16 @@
 允许带、超带红色重描、采样缺口阴影，逐样本列出超带区间与累计剂量；
 复核记录可保存、回看并导出 JSON。
 
+⑥ **补做排程**：在任意已保存复核记录上一键发起。系统只提取结论为
+**「复核」或「数据不足」**的样本（**「通过」的样本绝不重复安排**），
+把该记录对应的**原排程完整保留为不可修改的历史**（分钟湿度曲线原样钉在
+时间轴 `[0, 原结束分钟]` 上），从原结束分钟**之后**重新安排失败样本。
+补做计划继续遵守箱容量、耐受区间、不可相邻、每分钟换档速率与**独立换档
+上限**，**沿用原有占用**；新旧时间轴**衔接处**（历史末段停留湿度 →
+补做首次换档目标）同样校验独立换档差值。无失败样本返回并保存**空方案**；
+补做无解时返回冲突与最小可调整项，**不保存半成品**。页面可查看
+「历史 / 补做」双段时间轴（历史段灰色斜纹、衔接点虚线标注）并导出 JSON。
+
 ---
 
 ## 一条命令启动
@@ -54,9 +64,10 @@ docker compose up --build
 | --- | --- |
 | 前端 | 原生 HTML / CSS / JavaScript（无框架、无构建步骤），SVG 画湿度曲线、Pointer Events 拖拽 |
 | 后端 | Flask（REST API）+ waitress 生产级 WSGI |
-| 存储 | SQLite（样本、阶梯、互斥关系、占用、容量/独立换档上限设置、排程快照、复核记录） |
+| 存储 | SQLite（样本、阶梯、互斥关系、占用、容量/独立换档上限设置、排程快照、复核记录、补做排程） |
 | 编排引擎 | `app/scheduler.py`，纯标准库分钟级确定性仿真 + 排列/启发式搜索，可独立单测 |
 | 复核引擎 | `app/review.py`，纯标准库分段线性曲线解析积分（允许带面积 / 采样缺口），可独立单测 |
+| 补做引擎 | `app/redo.py`，原排程作为不可修改湿度前缀、失败样本在结束分钟之后重排（含衔接处换档差值校验），可独立单测 |
 
 ### 本地不使用 Docker 运行
 
@@ -118,8 +129,11 @@ python3 -m unittest discover -s app/tests -v
 | POST | `/api/validate` | 手工排程校验，body: `{board_times:{样本id:入箱分钟}}` |
 | GET | `/api/schedule/latest` | 最近一次排程快照 |
 | POST | `/api/review` | 对最近排程（或 body.`schedule`）做实测湿度复核，见下 |
-| GET | `/api/reviews` | 已保存复核记录列表（可带 `?limit=`） |
-| GET/DELETE | `/api/reviews/{id}` | 查看单条复核记录（含完整结果）/ 删除 |
+| GET | `/api/reviews` | 已保存复核记录列表（可带 `?limit=`，各条附 `redo_id`） |
+| GET/DELETE | `/api/reviews/{id}` | 查看单条复核记录（含完整结果与内嵌原排程快照）/ 删除 |
+| POST | `/api/reviews/{id}/redo` | 对该复核记录生成**补做排程**（见下） |
+| GET | `/api/redo` | 补做方案列表（可带 `?review_id=` 过滤） |
+| GET/DELETE | `/api/redo/{id}` | 查看 / 删除单条补做方案 |
 | GET | `/` | 编排台页面 |
 
 ### 样本 JSON 示例
@@ -224,6 +238,44 @@ python3 -m unittest discover -s app/tests -v
 
 `save:true` 时写入 SQLite（`reviews` 表）并返回 `review_id`、`created_at`，
 可经 `GET /api/reviews` 回看、页面内叠加渲染并再次导出 JSON。
+保存时复核 payload 会内嵌当时的**原排程完整快照**（`source_schedule`），
+作为后续补做排程的不可修改历史依据（列表接口只返回摘要，不含大快照）。
+
+---
+
+## 补做排程
+
+在⑤的「已保存复核记录」上点击「补做排程」，或调用
+`POST /api/reviews/{id}/redo`（body 可空；也可携带 `capacity` /
+`max_shift_delta` / `samples` / `occupancies` 临时覆盖，缺省沿用原排程快照
+中的设置与占用）：
+
+- 只安排结论为 `review` / `insufficient` 的样本；结论 `pass` 的样本
+  **不会被重复安排**（结果中的 `passed_sample_ids` 明示）；
+- 原排程的分钟湿度曲线固定为 `[0, history_end_minute]` 的不可修改前缀，
+  补做入箱分钟严格大于 `history_end_minute`；样本定义以原快照为准
+  （即使库中后来修改过样本，历史也不随之变化）；
+- 补做段重新跑完整引擎：容量、耐受区间、不可相邻、每分钟换档速率、
+  独立换档上限全部生效，并沿用原有占用（历史段与未来段都保留）；
+- **衔接处校验**：空箱从历史末段停留湿度预调到首个补做样本的入箱平衡
+  湿度，这一换档的两端目标差同样不得超过独立换档上限；空箱无法插入
+  中间停留段，因此该差值不可回避——超限时给出 `redo-junction` 冲突；
+- **无失败样本**：返回 `feasible:true, empty:true` 的空方案并保存；
+- **补做无解**：HTTP 200 返回 `feasible:false` 与 `conflicts[]` /
+  `minimal_adjustment`（`redo-junction` 新旧衔接、`redo-shift` 补做样本
+  自身相邻目标差，其余为容量/占用/组合诊断），**不写库**；
+- 可行时写入 SQLite（`redo_plans` 表，外键随复核记录级联删除）并返回
+  `redo_id`。同一复核可多次发起补做，页面「查看补做」打开最近一条。
+
+### 补做导出 / 返回 JSON 包含
+
+`kind:"redo"`、`feasible`、`empty`、`review_id`、`redo_id`、
+`history_end_minute`、`junction`（`{minute, history_rh}`）、
+`failed_sample_ids`、`passed_sample_ids`、`redo_board_times`、
+`redo_end_minute`、`capacity`、`max_shift_delta`、`occupancies`（沿用）、
+`segments[]`（每段带 `timeline: "history" | "redo"` 与约束来源）、
+`lanes[]`（每条泳道带 `timeline` 标记）、`capacity_series[]`，
+无解时的 `conflicts[]` 与 `minimal_adjustment`。
 
 ---
 
@@ -233,14 +285,16 @@ python3 -m unittest discover -s app/tests -v
 app/
   scheduler.py     # 编排引擎（无框架依赖，可独立单测）
   review.py        # 实测湿度复核引擎（分段线性曲线解析积分，可独立单测）
-  db.py            # SQLite 持久化（含复核记录）
+  redo.py          # 补做排程引擎（固定历史前缀 + 失败样本重排，可独立单测）
+  db.py            # SQLite 持久化（含复核记录与补做排程）
   server.py        # Flask 路由 + waitress
   static/
     index.html     # 单页界面
     style.css
-    app.js         # 时间轴/SVG/拖拽/复核/导出
+    app.js         # 时间轴/SVG/拖拽/复核/补做/导出
   tests/test_scheduler.py
   tests/test_review.py
+  tests/test_redo.py
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -341,3 +341,42 @@ input, select {
 .dot.pass { background: var(--hold); }
 .dot.review { background: var(--bad); }
 .dot.insufficient { background: #b08d3f; }
+
+/* ------------------------------------------------------------------ */
+/* ⑥ 补做排程 */
+/* ------------------------------------------------------------------ */
+.lg.hist { background: #b8b0a0; }
+.lg.join { background: #b08d3f; }
+
+.redo-meta { margin: 8px 0 10px; }
+.redo-meta-line {
+  font-size: 12.5px; color: #5d5446; padding: 4px 8px;
+  border-left: 3px solid var(--accent2); background: #fbf8f1;
+  margin-bottom: 4px; border-radius: 0 4px 4px 0;
+}
+.redo-meta-line.all-pass { border-left-color: var(--hold); }
+.redo-meta-line .tag {
+  display: inline-block; background: var(--accent); color: #fff;
+  border-radius: 3px; padding: 0 6px; font-size: 11px; margin-right: 6px;
+}
+
+/* 历史泳道：降低不透明度并加斜纹感，明确不可修改 */
+.redo-lane-row.is-history .lane-name { color: #a89f8c; }
+.block.history-block {
+  opacity: 0.55;
+  background-image: repeating-linear-gradient(
+    45deg, rgba(255,255,255,.25) 0 4px, rgba(0,0,0,.05) 4px 8px);
+}
+
+/* 新旧衔接点标记 */
+.redo-junction-flag {
+  position: absolute; top: 0; z-index: 5;
+  font-size: 10.5px; color: #8a6a1f; background: #f3e6c4;
+  border: 1px solid #d8bd77; border-radius: 3px; padding: 0 5px;
+  transform: translateX(-2px); pointer-events: none; white-space: nowrap;
+}
+
+/* 禁用的小按钮 */
+.rv-record .mini:disabled {
+  opacity: .45; cursor: not-allowed; background: #efece4; color: #b3ab99;
+}

@@ -236,7 +236,8 @@ class _Engine:
     def __init__(self, samples: list[_Sample], occs: list[_Occ],
                  capacity: int, board_times: dict[int, int],
                  horizon: int = MAX_HORIZON, validate: bool = False,
-                 max_shift_delta: Optional[float] = None):
+                 max_shift_delta: Optional[float] = None,
+                 fixed_rh: Optional[list[float]] = None):
         self.samples = samples
         self.by_id = {s.id: s for s in samples if s.id is not None}
         self.occs = sorted(occs, key=lambda o: o.start)
@@ -260,6 +261,15 @@ class _Engine:
             self.rh = s.eq_rh
         elif self.occs:
             self.rh = self.occs[0].rh
+
+        # 补做排程：[0 .. pin_end] 分钟的湿度曲线为不可修改的历史，
+        # 引擎只在 pin_end 之后做决策；入箱任务必须全部晚于 pin_end。
+        self.fixed_rh: Optional[list[float]] = None
+        if fixed_rh is not None:
+            if not fixed_rh:
+                raise SchedulingError("固定历史时间轴为空，无法安排补做")
+            self.fixed_rh = [float(x) for x in fixed_rh]
+            self.rh = self.fixed_rh[-1]
 
     # ---- 辅助 ------------------------------------------------------------ #
     def _active(self, t: int) -> list[_Mission]:
@@ -564,6 +574,11 @@ class _Engine:
         if t > 0:
             d = rh - self.rh_series[t - 1]
             for m in active:
+                # 补做：历史末→入箱分钟的换档发生在空箱（该任务本分钟才入箱），
+                # 只受独立换档上限约束，不按该样本的每分钟速率判罚
+                if self.fixed_rh is not None and m.board == t and \
+                        t == len(self.fixed_rh):
+                    continue
                 if abs(d) > m.rate_cap + EPS:
                     self._viol(t, 'rate',
                                f"样本 {m.s.code} 的换档上限 "
@@ -695,6 +710,8 @@ class _Engine:
 
     # ---- 主循环 ---------------------------------------------------------- #
     def run(self) -> dict:
+        if self.fixed_rh is not None:
+            return self._run_pinned()
         self.rh_series = [self.rh]
 
         # 入箱时间为 0 的任务直接装载
@@ -795,6 +812,108 @@ class _Engine:
 
         # 独立换档上限：在完整时间轴上比较相邻段目标值（与速率无关的箱级设置）。
         # 仿真已中断（fatal）时只报原有致命问题，避免对截断的时间轴追加噪声违规。
+        if self.fatal is None:
+            self._check_shift_limit(end)
+        return self._build(end)
+
+    def _run_pinned(self) -> dict:
+        """固定历史前缀模式（补做排程）。
+
+        历史分钟 0..E（rh[0..E] 共 E+1 个节点）的湿度曲线完整固定、不可修改；
+        引擎从第 E 分钟的决策开始推进，入箱任务必须全部晚于 E。
+        占用段全量保留（历史段固定湿度、未来段照常约束），容量从 E+1 起按
+        在箱的补做任务计算；新旧时间轴衔接处的换档差值由 _check_shift_limit
+        在整条曲线上自动校验。
+        """
+        self.rh_series = list(self.fixed_rh)
+        pin_end = len(self.fixed_rh) - 1
+
+        for sid, b in self.bt.items():
+            if b <= pin_end:
+                s = self.by_id.get(sid)
+                self.fatal = (f"补做样本 {s.code if s else sid} 的入箱分钟 {b} "
+                              f"必须晚于原排程结束分钟 {pin_end}")
+                return self._build(pin_end)
+
+        # 历史前缀的容量记录：补做阶段之前箱内无补做任务（历史任务不可修改，
+        # 其负载由调用方在结果上另行回填展示）
+        self.load_series = [0] * (pin_end + 1)
+
+        stall = 0
+        end = self.horizon
+        for t in range(pin_end, self.horizon):
+            if self.ramp is None:
+                self._decide(t)
+            self._advance(t + 1)
+            self.rh_series.append(self.rh)
+
+            active = self._active(t + 1)
+            for m in active:
+                m.trace[t + 1] = self._trace_phase(m, t + 1)
+            if active:
+                for m in active:
+                    if m.idx < 0:
+                        continue
+                    at_rh = (m.target is not None and
+                             abs(self.rh - m.target) < EPS)
+                    if not m.away and at_rh and not m.step_done:
+                        m.dwelled += 1
+                        if m.dwelled >= m.need_dwell:
+                            m.step_done = True
+            self._check(t + 1)
+            self.load_series.append(
+                len(active) + self._occ_load(t + 1))
+
+            progressing = self.ramp is not None or any(
+                (not m.away and m.target is not None and
+                 abs(self.rh - m.target) < EPS and not m.step_done)
+                or (m.away and not m.step_done)
+                for m in active)
+            near_event = any(t + 1 < o.start <= t + 121 or
+                             t + 1 < o.end <= t + 121 for o in self.occs)
+            if active and not progressing and not near_event:
+                stall += 1
+            else:
+                stall = 0
+            if stall > 120 and not self.validate:
+                self.fatal = "排程停滞：换档窗口被占用段/在箱样本区间持续阻挡"
+                end = t + 1
+                break
+
+            boarded_ids = {m.s.id for m in self.missions}
+            unboarded_done = all(m.unboarded for m in self.missions)
+            all_accounted = all(sid in boarded_ids for sid in self.bt)
+            future = any(bt > t + 1 for bt in self.bt.values())
+            future_occ = any(o.end > t + 1 or o.start > t + 1 for o in self.occs)
+            pending_now = [sid for sid, b in self.bt.items() if b == t + 1]
+            if not active and not future and not self.ramp and not future_occ:
+                if unboarded_done and all_accounted:
+                    end = t + 1
+                    break
+                if unboarded_done and not all_accounted:
+                    miss = [self.by_id.get(sid) for sid in self.bt
+                            if sid not in boarded_ids]
+                    codes = ', '.join(m.code for m in miss if m)
+                    self.fatal = f"样本 {codes} 未入箱，且箱内已无可驱动任务"
+                    end = t + 1
+                    break
+            if not self.validate and pending_now:
+                for sid in pending_now:
+                    s = self.by_id.get(sid)
+                    if s and abs(self.rh - s.eq_rh) > EPS:
+                        self.fatal = (f"样本 {s.code} 到点({t+1} 分钟)无法入箱："
+                                      f"箱内 {self.rh:g}% ≠ 平衡湿度 {s.eq_rh:g}%")
+                        end = t + 1
+                        break
+                if self.fatal:
+                    break
+            if self.fatal and not self.validate:
+                end = t + 1
+                break
+        else:
+            if not all(m.unboarded for m in self.missions):
+                self.fatal = f"超出排程时间上限（{self.horizon} 分钟）仍未完成全部样本"
+
         if self.fatal is None:
             self._check_shift_limit(end)
         return self._build(end)

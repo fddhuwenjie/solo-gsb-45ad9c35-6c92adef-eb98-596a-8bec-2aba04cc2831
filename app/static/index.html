@@ -151,6 +151,36 @@
       </div>
     </div>
   </section>
+
+  <!-- 补做排程 -->
+  <section class="panel wide hidden" id="redoPanel" style="grid-column: 1 / -1;">
+    <div class="panel-head">
+      <h2>⑥ 补做排程（原排程保留为不可修改历史，从其结束分钟之后重排失败样本）</h2>
+      <div class="legend">
+        <span><i class="lg hist"></i>历史（不可修改）</span>
+        <span><i class="lg ramp"></i>补做换档</span>
+        <span><i class="lg hold"></i>补做保持</span>
+        <span><i class="lg cool"></i>冷却/平衡</span>
+        <span><i class="lg join"></i>新旧衔接点</span>
+      </div>
+    </div>
+
+    <div id="redoMeta" class="redo-meta"></div>
+    <div id="redoStatus" class="status">尚未生成补做排程：在⑤的「已保存复核记录」中选择一条复核，点击「补做排程」。</div>
+    <div id="redoConflictBox" class="conflicts hidden"></div>
+
+    <div class="timeline-wrap">
+      <div id="redoRuler" class="ruler"></div>
+      <div id="redoRhTrack" class="rh-track"></div>
+      <div id="redoLanes"></div>
+      <div id="redoOccTrack" class="occ-track"></div>
+      <div id="redoCapTrack" class="cap-track"></div>
+    </div>
+    <div class="runbar">
+      <button class="btn" id="redoExport">⬇ 导出补做 JSON</button>
+      <button class="btn danger" id="redoDelete">删除当前补做方案</button>
+    </div>
+  </section>
 </main>
 
 <!-- 样本编辑弹层 -->

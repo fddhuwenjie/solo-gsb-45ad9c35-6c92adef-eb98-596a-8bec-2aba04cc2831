@@ -1201,9 +1201,12 @@ async function loadReviewRecords() {
     div.innerHTML = `<span><span class="dot ${r.conclusion}"></span>#${r.id} · ${
       esc(r.created_at)} · <b>${name}</b> · 通过 ${s.pass ?? 0}/复核 ${
       s.review ?? 0}/数据不足 ${s.insufficient ?? 0}${
+      r.redo_id ? ` · <span style="color:#5e8b6e">已补做 #${r.redo_id}</span>` : ''}${
       r.note ? ' · ' + esc(r.note) : ''}</span>
       <span class="ops">
         <button class="mini" data-act="view">查看</button>
+        <button class="mini" data-act="redo">补做排程</button>
+        <button class="mini" data-act="redoview" ${r.redo_id ? '' : 'disabled'}>查看补做</button>
         <button class="mini" data-act="json">JSON</button>
         <button class="mini del" data-act="del">删除</button>
       </span>`;
@@ -1213,6 +1216,11 @@ async function loadReviewRecords() {
       renderReview(rec.payload);
       setRvStatus(`已载入复核记录 #${r.id}（${rec.created_at}）。`, 'ok');
     };
+    div.querySelector('[data-act="redo"]').onclick = () => createRedo(r.id);
+    if (r.redo_id) {
+      div.querySelector('[data-act="redoview"]').onclick =
+        () => loadRedoPlan(r.redo_id);
+    }
     div.querySelector('[data-act="json"]').onclick = () => {
       downloadReviewJSON(r.payload, `humidity-review-${r.id}.json`);
     };
@@ -1251,6 +1259,395 @@ $('#rvSave').onclick = () => runReview({ save: true });
 $('#rvFill').onclick = fillPlanReadings;
 $('#rvExport').onclick = exportReviewJSON;
 $('#rvReload').onclick = loadReviewRecords;
+
+// --------------------------------------------------------------------------- //
+// 补做排程
+// --------------------------------------------------------------------------- //
+state.redo = null;        // 当前展示的补做方案
+state.redoPx = 2;
+
+async function createRedo(rid) {
+  setRedoStatus('正在固定原排程历史并求解补做顺序…', 'warn');
+  $('#redoPanel').classList.remove('hidden');
+  $('#redoPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  try {
+    const plan = await api(`/api/reviews/${rid}/redo`, { method: 'POST', body: {} });
+    if (!plan.feasible) {
+      state.redo = plan;
+      renderRedo(plan);
+      setRedoStatus('✗ 补做无解：已列出冲突约束与最小可调整项；未保存任何半成品。', 'bad');
+      return;
+    }
+    // 成功（含空方案）才落库，刷新复核列表上的「已补做」标记
+    await loadReviewRecords();
+    state.redo = plan;
+    renderRedo(plan);
+    if (plan.empty) {
+      setRedoStatus(`✓ 复核 #${rid} 没有需要补做的样本（全部通过），返回空方案；历史排程原样保留。`, 'ok');
+    } else {
+      setRedoStatus(`✓ 补做排程已生成并保存（#${plan.redo_id}）：${
+        (plan.failed_sample_ids || []).length} 个失败样本从 ${
+        fmtMin(plan.history_end_minute)} 之后重新安排，历史未改动，衔接处已校验。`, 'ok');
+    }
+  } catch (e) {
+    renderRedo(null);
+    setRedoStatus('补做排程失败：' + e.message, 'bad');
+  }
+}
+
+async function loadRedoPlan(pid) {
+  try {
+    const rec = await api(`/api/redo/${pid}`);
+    state.redo = rec.payload;
+    $('#redoPanel').classList.remove('hidden');
+    $('#redoPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    renderRedo(rec.payload);
+    setRedoStatus(rec.payload.feasible
+      ? `已载入补做方案 #${pid}（源自复核 #${rec.review_id}，${rec.created_at}）。`
+      : `补做方案 #${pid} 不可行（未保存）。`, rec.payload.feasible ? 'ok' : 'bad');
+  } catch (e) {
+    setRedoStatus('载入补做方案失败：' + e.message, 'bad');
+  }
+}
+
+function setRedoStatus(msg, kind = '') {
+  const el = $('#redoStatus');
+  el.textContent = msg;
+  el.className = 'status ' + kind;
+}
+
+function redoMinutes(plan) {
+  let max = plan.end_minute ?? plan.history_end_minute ?? 0;
+  for (const o of plan.occupancies || []) max = Math.max(max, o.end);
+  for (const l of plan.lanes || []) max = Math.max(max, l.unboard ?? l.board + 5);
+  return Math.max(60, max + 20);
+}
+
+function renderRedo(plan) {
+  const panel = $('#redoPanel');
+  panel.classList.remove('hidden');
+  const cbox = $('#redoConflictBox');
+  cbox.classList.add('hidden');
+  cbox.innerHTML = '';
+  if (!plan) {
+    $('#redoRhTrack').innerHTML = '';
+    $('#redoLanes').innerHTML = '';
+    $('#redoOccTrack').innerHTML = '';
+    $('#redoCapTrack').innerHTML = '';
+    $('#redoRuler').innerHTML = '';
+    $('#redoMeta').innerHTML = '';
+    return;
+  }
+  renderRedoMeta(plan);
+  if (!plan.feasible && plan.conflicts?.length) renderRedoConflicts(plan.conflicts);
+
+  const total = redoMinutes(plan);
+  state.redoPx = total > 1000 ? 0.8 : total > 500 ? 1.2 : 2;
+  const W = Math.max(900, total * state.redoPx + 120);
+  renderRedoRuler(W, total);
+  renderRedoRh(W, total, plan);
+  renderRedoLanes(W, plan);
+  renderRedoOcc(W, plan);
+  renderRedoCap(W, plan);
+}
+
+function renderRedoMeta(plan) {
+  const failed = (plan.failed_sample_ids || []).map(id => {
+    const l = (plan.lanes || []).find(x => x.sample_id === id);
+    return l ? l.code : '#' + id;
+  });
+  const passed = (plan.passed_sample_ids || []).map(id => {
+    const l = (plan.lanes || []).find(x => x.sample_id === id);
+    return l ? l.code : '#' + id;
+  });
+  $('#redoMeta').innerHTML = `
+    <div class="redo-meta-line">
+      <span class="tag">历史截止</span>原排程 0–${fmtMin(plan.history_end_minute)}
+      分钟完整保留、不可修改；衔接点：第 ${fmtMin((plan.history_end_minute ?? 0) + 1)} 分钟
+      （历史末段停留 ${num(plan.junction?.history_rh)}%RH）
+    </div>
+    <div class="redo-meta-line ${failed.length ? '' : 'all-pass'}">
+      <span class="tag">补做样本</span>${failed.length
+        ? esc(failed.join('、')) + '（结论为「复核」或「数据不足」）'
+        : '无（全部样本通过，空方案）'}
+    </div>
+    <div class="redo-meta-line">
+      <span class="tag">不重复安排</span>${passed.length ? esc(passed.join('、')) : '无'}
+      （结论为「通过」的样本不再进入补做）
+    </div>
+    <div class="redo-meta-line">
+      <span class="tag">沿用设置</span>箱容量 ${plan.capacity} 位 ｜ 独立换档上限 ${
+        plan.max_shift_delta == null ? '不限制' : num(plan.max_shift_delta) + '%RH'}
+      ｜ 已有占用 ${(plan.occupancies || []).length} 段全量沿用
+      ${plan.redo_id ? `｜ 补做方案 #${plan.redo_id}` : ''}
+      ${plan.redo_end_minute != null && !plan.empty
+        ? `｜ 补做结束 ${fmtMin(plan.redo_end_minute)}` : ''}
+    </div>`;
+}
+
+function renderRedoConflicts(conflicts) {
+  const box = $('#redoConflictBox');
+  box.classList.remove('hidden');
+  box.innerHTML = '<h4>补做冲突约束与最小可调整项（未保存）</h4>';
+  conflicts.forEach((c, i) => {
+    const div = document.createElement('div');
+    div.className = 'conflict';
+    const tag = `<span class="tag ${c.severity === 'soft' ? 'soft' : ''}">${
+      { capacity: '容量', range: '区间', 'rate': '换档速率',
+        'shift-limit': '换档上限', 'redo-shift': '补做换档上限',
+        'redo-junction': '新旧衔接', adjacency: '不可相邻',
+        occupancy: '已有占用', 'occupancy-window': '占用时间窗',
+        horizon: '总机时', combination: '组合约束',
+        'occ-overlap': '占用重叠' }[c.kind] || c.kind}</span>`;
+    const fix = c.suggestion
+      ? `<div class="fixit"><button data-i="${i}">⚙ 应用最小调整：${
+          esc(c.suggestion.title || c.suggestion.label || '调整设置')}</button></div>`
+      : '';
+    div.innerHTML = `${tag}<span class="msg">${esc(c.message)}</span>${fix}`;
+    box.appendChild(div);
+  });
+  $$('.fixit button', box).forEach(btn => {
+    btn.onclick = () => applyRedoFix(conflicts[+btn.dataset.i].suggestion);
+  });
+}
+
+// 补做冲突的一键调整目前支持放宽独立换档上限；其余引导操作员手工处理
+async function applyRedoFix(sug) {
+  try {
+    if (sug.type === 'shift-limit') {
+      state.maxShiftDelta = sug.value;
+      $('#maxShiftDelta').value = sug.value;
+      await api('/api/settings', { method: 'POST',
+        body: { max_shift_delta: sug.value } });
+      setRedoStatus(`已把独立换档上限放宽为 ${sug.value}%RH，请重新点击该复核记录的「补做排程」。`, 'ok');
+    } else if (sug.type === 'capacity') {
+      state.capacity = Math.max(state.capacity, sug.value || state.capacity + 1);
+      $('#capacity').value = state.capacity;
+      await api('/api/settings', { method: 'POST',
+        body: { capacity: state.capacity } });
+      setRedoStatus(`已把箱容量调整为 ${state.capacity}，请重新发起补做排程。`, 'ok');
+    } else {
+      setRedoStatus('该调整需要手工修改占用段或样本阶梯（历史排程不可修改），调整后重新发起补做。', 'warn');
+    }
+  } catch (e) {
+    setRedoStatus('应用调整失败：' + e.message, 'bad');
+  }
+}
+
+function renderRedoRuler(W, total) {
+  const ruler = $('#redoRuler');
+  ruler.style.width = W + 'px';
+  ruler.innerHTML = '<span class="track-label" style="background:transparent">时间 →</span>';
+  const step = total > 1000 ? 120 : total > 500 ? 60 : 30;
+  for (let m = 0; m <= total; m += step) {
+    const t = document.createElement('div');
+    t.className = 'tick';
+    t.style.left = (74 + m * state.redoPx) + 'px';
+    t.textContent = fmtMin(m);
+    ruler.appendChild(t);
+  }
+}
+
+function renderRedoRh(W, total, plan) {
+  const track = $('#redoRhTrack');
+  track.style.width = W + 'px';
+  track.innerHTML = '<span class="track-label">箱内湿度</span>';
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('x', 74); svg.setAttribute('y', 0);
+  svg.setAttribute('width', W - 74); svg.setAttribute('height', 64);
+  svg.style.left = '74px';
+  const L = 26, R = 8;
+  const yOf = rh => L + (1 - rh / 100) * (64 - L - R);
+  const xOf = m => m * state.redoPx;
+  for (const v of [0, 50, 100]) {
+    const line = document.createElementNS(svgNS, 'line');
+    line.setAttribute('x1', 0); line.setAttribute('x2', W - 80);
+    line.setAttribute('y1', yOf(v)); line.setAttribute('y2', yOf(v));
+    line.setAttribute('stroke', v === 50 ? '#e2dac8' : '#f0ecdf');
+    svg.appendChild(line);
+    const lab = document.createElementNS(svgNS, 'text');
+    lab.setAttribute('x', 2); lab.setAttribute('y', yOf(v) - 2);
+    lab.setAttribute('font-size', 9); lab.setAttribute('fill', '#a89f8c');
+    lab.textContent = v;
+    svg.appendChild(lab);
+  }
+  // 历史/补做分界竖线（新旧衔接点）
+  const jx = xOf((plan.history_end_minute ?? 0) + 1);
+  const jline = document.createElementNS(svgNS, 'line');
+  jline.setAttribute('x1', jx); jline.setAttribute('x2', jx);
+  jline.setAttribute('y1', 2); jline.setAttribute('y2', 62);
+  jline.setAttribute('stroke', '#b08d3f');
+  jline.setAttribute('stroke-dasharray', '4 3');
+  jline.setAttribute('stroke-width', '1.4');
+  jline.appendChild(document.createElementNS(svgNS, 'title')).textContent =
+    '新旧时间轴衔接点：换档差值同样受独立换档上限约束';
+  svg.appendChild(jline);
+
+  for (const seg of (plan.segments || [])) {
+    const history = seg.timeline === 'history';
+    const line = document.createElementNS(svgNS, 'line');
+    line.setAttribute('x1', xOf(seg.start));
+    line.setAttribute('x2', xOf(seg.end));
+    if (seg.kind === 'hold') {
+      line.setAttribute('y1', yOf(seg.start_rh));
+      line.setAttribute('y2', yOf(seg.end_rh));
+      line.setAttribute('stroke', history ? '#b8b0a0' : '#5e8b6e');
+    } else {
+      line.setAttribute('y1', yOf(seg.from_rh ?? seg.start_rh));
+      line.setAttribute('y2', yOf(seg.end_rh));
+      line.setAttribute('stroke', history ? '#b8b0a0' : '#c76a3e');
+    }
+    line.setAttribute('stroke-width', history ? 1.6 : 2.2);
+    if (history) line.setAttribute('stroke-dasharray', '5 3');
+    svg.appendChild(line);
+  }
+  track.appendChild(svg);
+}
+
+function renderRedoLanes(W, plan) {
+  const box = $('#redoLanes');
+  box.innerHTML = '';
+  const histEnd = plan.history_end_minute ?? 0;
+  for (const lane of (plan.lanes || [])) {
+    const row = document.createElement('div');
+    row.className = 'lane redo-lane-row ' +
+      (lane.timeline === 'history' ? 'is-history' : 'is-redo');
+    row.style.width = W + 'px';
+    const name = document.createElement('span');
+    name.className = 'lane-name';
+    name.textContent = (lane.timeline === 'history' ? '【历史】' : '【补做】') +
+      ' ' + lane.code;
+    row.appendChild(name);
+    for (const p of (lane.pieces || [])) {
+      const b = document.createElement('div');
+      b.className = 'block ' + p.kind + (lane.timeline === 'history' ? ' history-block' : '');
+      b.style.left = (74 + p.start * state.redoPx) + 'px';
+      b.style.width = Math.max(3, (p.end - p.start) * state.redoPx) + 'px';
+      b.textContent = lane.timeline === 'redo' ? phaseLabel(p, lane) : '';
+      b.title = `${lane.code} · ${phaseName(p.kind)}${
+        p.step >= 0 ? ' 第' + (p.step + 1) + '档' : ''}：${
+        fmtMin(p.start)}–${fmtMin(p.end)}（${
+        lane.timeline === 'history' ? '历史，不可修改' : '补做'}）`;
+      row.appendChild(b);
+    }
+    box.appendChild(row);
+  }
+  // 历史/补做分界标记（绝对定位在泳道区顶部）
+  const flag = document.createElement('div');
+  flag.className = 'redo-junction-flag';
+  flag.style.left = (74 + (histEnd + 1) * state.redoPx) + 'px';
+  flag.title = '新旧衔接点';
+  flag.textContent = '⇢ 补做开始';
+  box.appendChild(flag);
+}
+
+function renderRedoOcc(W, plan) {
+  const track = $('#redoOccTrack');
+  track.style.width = W + 'px';
+  track.innerHTML = '<span class="track-label">已有占用</span>';
+  for (const o of (plan.occupancies || [])) {
+    const b = document.createElement('div');
+    b.className = 'occ-block';
+    b.style.left = (74 + o.start * state.redoPx) + 'px';
+    b.style.width = Math.max(4, (o.end - o.start) * state.redoPx) + 'px';
+    b.textContent = `🔒 ${o.note || '占用'} ${num(o.rh)}% ×${o.slots}位`;
+    b.title = `占用 ${fmtMin(o.start)}-${fmtMin(o.end)}，固定 ${num(o.rh)}%RH，${o.slots} 位（沿用原排程）`;
+    track.appendChild(b);
+  }
+}
+
+function renderRedoCap(W, plan) {
+  const track = $('#redoCapTrack');
+  track.style.width = W + 'px';
+  track.innerHTML = '<span class="track-label">容量占用</span>';
+  for (const c of (plan.capacity_series || [])) {
+    const ratio = c.load / plan.capacity;
+    const d = document.createElement('div');
+    d.className = 'cap-cell';
+    d.style.left = (74 + c.start * state.redoPx) + 'px';
+    d.style.width = Math.max(3, (c.end - c.start) * state.redoPx) + 'px';
+    d.style.background = c.load > plan.capacity ? 'var(--bad)' :
+      ratio > 0.8 ? '#d19a52' : ratio > 0 ? '#7fa083' : '#e8e2d2';
+    d.style.color = ratio > 0 ? '#fff' : '#b7af9d';
+    d.textContent = c.load;
+    d.title = `${fmtMin(c.start)}-${fmtMin(c.end)}：占用 ${c.load}/${plan.capacity}`;
+    track.appendChild(d);
+  }
+}
+
+function exportRedoJSON() {
+  if (!state.redo) {
+    setRedoStatus('请先生成或载入一个补做方案。', 'bad');
+    return;
+  }
+  const plan = state.redo;
+  const payload = {
+    exported_at: new Date().toISOString(),
+    kind: 'redo',
+    redo_id: plan.redo_id ?? null,
+    review_id: plan.review_id ?? null,
+    feasible: plan.feasible,
+    empty: plan.empty ?? false,
+    capacity: plan.capacity,
+    max_shift_delta: plan.max_shift_delta ?? null,
+    history_end_minute: plan.history_end_minute,
+    junction: plan.junction,
+    failed_sample_ids: plan.failed_sample_ids || [],
+    passed_sample_ids: plan.passed_sample_ids || [],
+    redo_board_times: plan.redo_board_times || {},
+    end_minute: plan.end_minute,
+    redo_end_minute: plan.redo_end_minute,
+    occupancies: plan.occupancies || [],
+    chamber_segments: (plan.segments || []).map(s => ({
+      start_minute: s.start, end_minute: s.end,
+      start: fmtMin(s.start), end: fmtMin(s.end),
+      timeline: s.timeline,
+      type: s.kind,
+      rh_start: s.from_rh ?? s.start_rh, rh_end: s.end_rh,
+      aboard: s.aboard, constraints: s.sources,
+    })),
+    sample_lanes: (plan.lanes || []).map(l => ({
+      sample_id: l.sample_id, code: l.code, timeline: l.timeline,
+      board_minute: l.board, unboard_minute: l.unboard,
+      board: fmtMin(l.board),
+      unboard: l.unboard == null ? null : fmtMin(l.unboard),
+      pieces: (l.pieces || []).map(p => ({
+        start_minute: p.start, end_minute: p.end,
+        start: fmtMin(p.start), end: fmtMin(p.end),
+        phase: phaseName(p.kind), step: p.step >= 0 ? p.step + 1 : null,
+      })),
+    })),
+    conflicts: plan.conflicts || [],
+    minimal_adjustment: plan.minimal_adjustment || null,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)],
+    { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `humidity-redo-${plan.redo_id || Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+$('#redoExport').onclick = exportRedoJSON;
+$('#redoDelete').onclick = async () => {
+  const pid = state.redo?.redo_id;
+  if (!pid) {
+    setRedoStatus('当前是未落库的（无解）方案或空结果，无需删除。', 'warn');
+    return;
+  }
+  if (!confirm(`确定删除补做方案 #${pid}？原复核记录与原排程历史不受影响。`)) return;
+  try {
+    await api(`/api/redo/${pid}`, { method: 'DELETE' });
+    state.redo = null;
+    renderRedo(null);
+    await loadReviewRecords();
+    setRedoStatus(`补做方案 #${pid} 已删除。`, 'ok');
+  } catch (e) {
+    setRedoStatus('删除失败：' + e.message, 'bad');
+  }
+};
 
 loadAll().catch(e => setStatus('初始化失败：' + e.message, 'bad'));
 loadReviewRecords();

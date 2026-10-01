@@ -11,6 +11,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from . import scheduler
 from . import review as review_mod
+from . import redo as redo_mod
 from .db import DB
 from .seed import seed_if_empty
 
@@ -266,6 +267,8 @@ def run_review():
     res['overall_conclusion'] = overall
     res['overall_conclusion_label'] = \
         review_mod.CONCLUSION_LABELS[overall]
+    # 原排程完整快照内嵌进复核记录：补做排程据此保留不可修改历史
+    res['source_schedule'] = schedule_obj
     if body.get('save'):
         note = str(body.get('note') or '')
         rid = db.save_review(res, overall, note)
@@ -284,7 +287,12 @@ def list_reviews():
         limit = max(1, min(200, int(request.args.get('limit', 50))))
     except ValueError:
         limit = 50
-    return jsonify(db.list_reviews(limit))
+    items = db.list_reviews(limit)
+    # 附带每条复核最近一次补做排程的 id（空方案也保存，便于回看）
+    for it in items:
+        latest_redo = db.latest_redo_for_review(it['id'])
+        it['redo_id'] = latest_redo['id'] if latest_redo else None
+    return jsonify(items)
 
 
 @app.get('/api/reviews/<int:rid>')
@@ -298,6 +306,66 @@ def get_review(rid: int):
 @app.delete('/api/reviews/<int:rid>')
 def remove_review(rid: int):
     db.delete_review(rid)
+    return jsonify({'ok': True})
+
+
+# --------------------------------------------------------------------------- #
+# 补做排程
+# --------------------------------------------------------------------------- #
+@app.post('/api/reviews/<int:rid>/redo')
+def run_redo(rid):
+    """基于已保存复核记录生成补做排程。
+
+    只安排结论为「复核」或「数据不足」的样本；原排程作为不可修改历史保留。
+    无失败样本 → 保存并返回空方案；补做无解 → 返回冲突且不保存半成品。
+    body 可携带 capacity / max_shift_delta / samples / occupancies 临时覆盖。
+    """
+    rec = db.get_review(rid)
+    if rec is None:
+        return jsonify({'error': '复核记录不存在'}), 404
+    body = request.get_json(force=True, silent=True) or {}
+    review_payload = rec['payload']
+    samples = body.get('samples') or _all_samples()
+    occs = body.get('occupancies')
+    capacity = body['capacity'] if 'capacity' in body else None
+    shift_limit = body['max_shift_delta'] if 'max_shift_delta' in body \
+        else None
+    try:
+        plan = redo_mod.plan_redo(
+            review_payload, samples, occs_raw=occs,
+            capacity=capacity, max_shift_delta=shift_limit)
+    except redo_mod.RedoError as e:
+        return jsonify({'error': str(e)}), 400
+    # 无解：返回冲突，不落库（不保存半成品）
+    if not plan.get('feasible'):
+        plan['review_id'] = rid
+        return jsonify(plan), 200
+    plan['review_id'] = rid
+    plan['review_created_at'] = rec['created_at']
+    pid = db.save_redo_plan(rid, plan)
+    plan['redo_id'] = pid
+    created = db.get_redo_plan(pid)
+    plan['created_at'] = created['created_at'] if created else None
+    return jsonify(plan)
+
+
+@app.get('/api/redo')
+def list_redo():
+    review_id = request.args.get('review_id', type=int)
+    return jsonify(db.list_redo_plans(review_id))
+
+
+@app.get('/api/redo/<int:pid>')
+def get_redo(pid):
+    rec = db.get_redo_plan(pid)
+    if rec is None:
+        return jsonify({'error': '补做排程不存在'}), 404
+    return jsonify(rec)
+
+
+@app.delete('/api/redo/<int:pid>')
+def remove_redo(pid):
+    db.delete_redo_plan(pid)
     return jsonify({'ok': True})
 
 
