@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+app/data/
+.git/
+.gitignore
+*.md

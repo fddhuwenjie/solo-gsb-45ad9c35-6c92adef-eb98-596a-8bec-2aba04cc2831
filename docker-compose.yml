@@ -1,0 +1,13 @@
+services:
+  humidity-bench:
+    build: .
+    image: humidity-stair-bench:latest
+    container_name: humidity-stair-bench
+    ports:
+      - "8000:8000"
+    volumes:
+      - humidity-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  humidity-data:

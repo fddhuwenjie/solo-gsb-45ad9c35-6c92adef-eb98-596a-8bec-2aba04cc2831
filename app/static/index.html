@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>古籍修复湿度阶梯试验编排台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>古籍修复 · 湿度阶梯试验编排台</h1>
+  <div class="sub">恒湿箱阶梯程序排程 · 容量 / 耐受区间 / 换档速率 / 独立换档上限 / 不可相邻联合校验</div>
+</header>
+
+<main>
+  <!-- 左栏：数据录入 -->
+  <section class="panel" id="left">
+    <div class="panel-head">
+      <h2>① 纸张样本与阶梯</h2>
+      <button class="btn small" id="addSampleBtn">＋ 新样本</button>
+    </div>
+    <div id="sampleList"></div>
+
+    <div class="panel-head mt">
+      <h2>② 恒湿箱设置</h2>
+    </div>
+    <div class="form-row">
+      <label>箱容量（样本位）
+        <input type="number" id="capacity" min="1" max="99" value="3">
+      </label>
+      <label>独立换档上限（每次换档最大目标湿度差 %RH）
+        <input type="number" id="maxShiftDelta" min="0.1" max="100" step="0.1"
+               placeholder="留空 = 不限制">
+      </label>
+      <button class="btn" id="saveCapBtn">保存设置</button>
+    </div>
+    <div class="form-hint">独立换档上限与各样本升降速率无关：时间轴上相邻两段目标湿度之差
+      超过该值时，自动排程与拖拽重排都会拒绝（留空则不启用，旧数据按不限制处理）。</div>
+
+    <div class="panel-head mt">
+      <h2>③ 已有占用</h2>
+      <button class="btn small" id="addOccBtn">＋ 添加占用</button>
+    </div>
+    <div id="occList"></div>
+
+    <div class="runbar">
+      <button class="btn primary big" id="runBtn">⇄ 生成可执行排程</button>
+      <button class="btn" id="resetDragBtn" title="放弃手工拖动，恢复自动排程时间">↺ 重置拖拽</button>
+      <button class="btn" id="exportBtn">⬇ 导出排程 JSON</button>
+    </div>
+  </section>
+
+  <!-- 右栏：时间轴 -->
+  <section class="panel wide" id="right">
+    <div class="panel-head">
+      <h2>④ 执行时间轴（可拖拽泳道，松手即重新校验）</h2>
+      <div class="legend">
+        <span><i class="lg ramp"></i>换档</span>
+        <span><i class="lg hold"></i>保持</span>
+        <span><i class="lg cool"></i>冷却/平衡</span>
+        <span><i class="lg occ"></i>已有占用</span>
+        <span><i class="lg bad"></i>违规</span>
+      </div>
+    </div>
+
+    <div id="statusBar" class="status">尚未排程。录入样本后点击「生成可执行排程」。</div>
+    <div id="conflictBox" class="conflicts hidden"></div>
+
+    <div class="timeline-wrap">
+      <div id="ruler" class="ruler"></div>
+      <div id="rhTrack" class="rh-track"></div>
+      <div id="lanes"></div>
+      <div id="occTrack" class="occ-track"></div>
+      <div id="capTrack" class="cap-track"></div>
+    </div>
+
+    <div id="detail" class="detail hidden"></div>
+  </section>
+
+  <!-- 实测湿度复核 -->
+  <section class="panel wide" id="reviewPanel" style="grid-column: 1 / -1;">
+    <div class="panel-head">
+      <h2>⑤ 一次试验实测湿度复核（载入最近排程时间轴）</h2>
+      <div class="legend">
+        <span><i class="lg plan"></i>计划</span>
+        <span><i class="lg meas"></i>实测</span>
+        <span><i class="lg band"></i>允许带</span>
+        <span><i class="lg over"></i>超带</span>
+        <span><i class="lg gap"></i>采样缺口</span>
+      </div>
+    </div>
+
+    <div class="review-layout">
+      <div class="review-controls">
+        <label class="full">粘贴传感器读数（每行一条：「分钟,湿度」两列，或单列湿度按分钟递增）
+          <textarea id="rvText" rows="9" placeholder=
+"例如（从 0 分钟起，每行一个湿度值）：
+50.0
+50.1
+50.2
+…
+也可写两列：
+0, 50.0
+1, 50.1"></textarea>
+        </label>
+        <div class="form-grid">
+          <label>单列读数起始分钟
+            <input id="rvStart" type="number" min="0" step="1" value="0">
+          </label>
+          <label>允许偏差 %RH
+            <input id="rvTol" type="number" min="0" step="0.1" value="2">
+          </label>
+          <label>累计偏差剂量上限（%RH·分钟）
+            <input id="rvDose" type="number" min="0" step="0.5" value="30">
+          </label>
+          <label>最大采样间隔（分钟）
+            <input id="rvGap" type="number" min="1" step="1" value="2">
+          </label>
+          <label class="full">备注
+            <input id="rvNote" type="text" placeholder="如：2026-09-28 第一次实测">
+          </label>
+        </div>
+        <div class="runbar">
+          <button class="btn primary" id="rvRun">▷ 载入最近排程并复核</button>
+          <button class="btn" id="rvFill" title="用计划值生成每分钟读数（偏差 0），便于试算">用计划值填满</button>
+          <button class="btn" id="rvSave">💾 保存复核记录</button>
+          <button class="btn" id="rvExport">⬇ 导出复核 JSON</button>
+        </div>
+        <div class="form-hint">
+          计划与实测均按<b>分段线性曲线</b>处理：在每个样本入箱→出箱窗口内按计划阶段切分，
+          用解析式精确积分超出允许带后的 |实测−计划| 面积（%RH·分钟）。
+          相邻采样间隔超过上限的区间为<b>采样缺口</b>，不插值、不计剂量，
+          该样本结论为<b>「数据不足」</b>；数据完整且剂量不超限才<b>「通过」</b>，否则<b>「复核」</b>。
+        </div>
+
+        <div class="panel-head mt">
+          <h3 style="font-size:13.5px">已保存复核记录</h3>
+          <button class="btn small" id="rvReload">↻ 刷新</button>
+        </div>
+        <div id="rvRecordList"></div>
+      </div>
+
+      <div class="review-output">
+        <div id="rvStatus" class="status">尚未复核。先在上方④生成排程，再粘贴本次试验的实测读数。</div>
+        <div class="timeline-wrap">
+          <div id="rvRuler" class="ruler"></div>
+          <div id="rvChart" class="rv-chart"></div>
+          <div id="rvLanes"></div>
+        </div>
+        <div id="rvSamples"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- 样本编辑弹层 -->
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <h3 id="modalTitle">样本</h3>
+    <div class="form-grid">
+      <label>编号 <input id="f_code" type="text" placeholder="如 P-017"></label>
+      <label>耐受下限 %RH <input id="f_min" type="number" min="0" max="100" step="0.1"></label>
+      <label>耐受上限 %RH <input id="f_max" type="number" min="0" max="100" step="0.1"></label>
+      <label>入箱平衡湿度 %RH <input id="f_eq" type="number" min="0" max="100" step="0.1"
+              placeholder="留空自动取区间内值"></label>
+      <label>出箱冷却/平衡时长(分) <input id="f_eqdur" type="number" min="0" step="1" value="30"></label>
+      <label class="full">不可相邻样本
+        <select id="f_excl" multiple size="3"></select>
+        <small>按住 Ctrl/Cmd 多选；标记后两者在箱时间不得重叠</small>
+      </label>
+    </div>
+
+    <h4>湿度阶梯</h4>
+    <table class="step-table">
+      <thead><tr><th>#</th><th>目标湿度 %RH</th><th>保持(分)</th><th>升降速率 %/分</th><th></th></tr></thead>
+      <tbody id="stepBody"></tbody>
+    </table>
+    <button class="btn small" id="addStepBtn">＋ 增加阶梯</button>
+
+    <div class="modal-actions">
+      <button class="btn" id="modalCancel">取消</button>
+      <button class="btn danger" id="modalDelete">删除样本</button>
+      <button class="btn primary" id="modalSave">保存</button>
+    </div>
+    <div id="modalError" class="modal-error"></div>
+  </div>
+</div>
+
+<!-- 占用编辑弹层 -->
+<div id="occModal" class="modal hidden">
+  <div class="modal-card">
+    <h3>已有占用</h3>
+    <div class="form-grid">
+      <label>开始(分钟) <input id="o_start" type="number" min="0" step="1"></label>
+      <label>结束(分钟) <input id="o_end" type="number" min="1" step="1"></label>
+      <label>固定湿度 %RH <input id="o_rh" type="number" min="0" max="100" step="0.1"></label>
+      <label>占用位数 <input id="o_slots" type="number" min="1" step="1" value="1"></label>
+      <label class="full">备注 <input id="o_note" type="text" placeholder="如：周三下午校准"></label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="occCancel">取消</button>
+      <button class="btn primary" id="occSave">添加</button>
+    </div>
+    <div id="occError" class="modal-error"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
